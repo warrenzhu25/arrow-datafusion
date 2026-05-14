@@ -173,6 +173,83 @@ pub trait TypePlanner: Debug + Send + Sync {
 | `datafusion/sql/src/expr/identifier.rs` | Converts SQL identifiers into DataFusion columns, compound identifiers, wildcard references, or qualified names. This is where many user-visible name-resolution details start before schema validation finishes them. |
 | `datafusion/sql/src/expr/subquery.rs` | Converts SQL subqueries into logical subquery expressions. The resulting `Expr` variants are later decorrelated or planned as subquery execution nodes. |
 
+#### Implementation Example
+
+The `select_to_plan()` method in `datafusion/sql/src/select.rs` (lines 76-294)
+shows the full complexity of SQL SELECT planning, including alias resolution,
+aggregate detection, and the interaction between HAVING, GROUP BY, and ORDER BY:
+
+```rust
+pub(super) fn select_to_plan(...) -> Result<LogicalPlan> {
+    // Process `from` clause - establishes base schema
+    let plan = self.plan_from_tables(select.from, planner_context)?;
+
+    // Process `where` clause
+    let base_plan = self.plan_selection(select.selection, plan, planner_context)?;
+
+    // Process the SELECT expressions
+    let select_exprs = self.prepare_select_exprs(&base_plan, select.projection, ...)?;
+
+    // Build alias map for HAVING/GROUP BY to reference SELECT aliases
+    // Example: SELECT MAX(c2) AS m FROM t GROUP BY c1 HAVING m > 10
+    // rewrites to: HAVING MAX(c2) > 10
+    let alias_map = extract_aliases(&select_exprs);
+
+    let having_expr_opt = select.having.map(|having_expr| {
+        let having_expr = self.sql_expr_to_logical_expr(having_expr, &combined_schema, ...)?;
+        // Dereference aliases in HAVING clause
+        let having_expr = resolve_aliases_to_exprs(having_expr, &alias_map)?;
+        normalize_col(having_expr, &projected_plan)
+    }).transpose()?;
+
+    // GROUP BY expressions - aliases from projection can conflict with input columns
+    let group_by_exprs = exprs.into_iter().map(|e| {
+        let group_by_expr = self.sql_expr_to_logical_expr(e, &combined_schema, ...)?;
+        // Remove aliases that conflict with base plan column names
+        let mut alias_map = alias_map.clone();
+        for f in base_plan.schema().fields() {
+            alias_map.remove(f.name());
+        }
+        let group_by_expr = resolve_aliases_to_exprs(group_by_expr, &alias_map)?;
+        // Handle positional references like GROUP BY 1, 2
+        let group_by_expr = resolve_positions_to_exprs(group_by_expr, &select_exprs)?;
+        normalize_col(group_by_expr, &projected_plan)
+    }).collect::<Result<Vec<Expr>>>()?;
+
+    // Collect aggregates from SELECT, HAVING, QUALIFY, and ORDER BY
+    let select_having_qualify_aggrs = find_aggregate_exprs(
+        select_exprs.iter().chain(having_expr_opt.iter()).chain(qualify_expr_opt.iter()),
+    );
+    let order_by_aggrs = find_aggregate_exprs(order_by_rex.iter().map(|s| &s.expr));
+
+    // Combine aggregates, avoiding duplicates
+    let mut aggr_exprs = select_having_qualify_aggrs;
+    for order_by_aggr in order_by_aggrs {
+        if !aggr_exprs.iter().any(|e| e == &order_by_aggr) {
+            aggr_exprs.push(order_by_aggr);
+        }
+    }
+
+    // Build aggregate plan if GROUP BY or aggregates present
+    let result = if !group_by_exprs.is_empty() || !aggr_exprs.is_empty() {
+        self.aggregate(&base_plan, &select_exprs, having_expr_opt.as_ref(), ...)?
+    } else {
+        // HAVING without GROUP BY is an error
+        if having_expr_opt.is_some() {
+            return plan_err!("HAVING clause must appear in GROUP BY or aggregate function");
+        }
+        // ...
+    };
+    // ... apply DISTINCT, ORDER BY, LIMIT
+}
+```
+
+This demonstrates the intricate interplay between SQL clauses: alias maps enable
+HAVING/GROUP BY to reference SELECT aliases while avoiding conflicts with input
+columns. Positional references (`GROUP BY 1`) are resolved against SELECT
+expressions. Aggregates are collected from multiple clauses to build a unified
+aggregate node that computes all needed values.
+
 The main SELECT logic begins when `statement.rs` identifies a query statement
 and calls into SELECT planning. `select.rs` first plans table references from the
 FROM clause, producing scan or join logical nodes. It then adds filters from the
@@ -368,6 +445,96 @@ impl Optimizer {
 | `datafusion/optimizer/src/eliminate_outer_join.rs` | Simplifies outer joins when filters make unmatched rows impossible. This can turn outer joins into inner joins or reduce the required join type. |
 | `datafusion/optimizer/src/push_down_limit.rs` | Moves limits closer to data sources and through operators where row-count semantics remain correct. This can reduce the amount of data read or sorted. |
 
+#### Implementation Example
+
+The `push_down_all_join()` function in `datafusion/optimizer/src/push_down_filter.rs`
+(lines 399-521) shows the complexity of pushing filters through joins, where
+predicates must be classified by which side they reference and whether they can
+become join conditions:
+
+```rust
+fn push_down_all_join(
+    predicates: Vec<Expr>,
+    inferred_join_predicates: Vec<Expr>,
+    mut join: Join,
+    on_filter: Vec<Expr>,
+) -> Result<Transformed<LogicalPlan>> {
+    let is_inner_join = join.join_type == JoinType::Inner;
+    let (left_preserved, right_preserved) = lr_is_preserved(join.join_type);
+
+    // Predicates are classified into three categories:
+    // 1) Can push through join to left or right child
+    // 2) Can become join conditions (inner join only)
+    // 3) Must be kept as filter above the join
+    let left_schema_columns = schema_columns(join.left.schema().as_ref());
+    let right_schema_columns = schema_columns(join.right.schema().as_ref());
+
+    let mut left_push = vec![];
+    let mut right_push = vec![];
+    let mut keep_predicates = vec![];
+    let mut join_conditions = vec![];
+    let mut checker = ColumnChecker::new(left_schema, right_schema);
+
+    for predicate in predicates {
+        if left_preserved && checker.is_left_only(&predicate) {
+            left_push.push(predicate);
+        } else if right_preserved && checker.is_right_only(&predicate) {
+            right_push.push(predicate);
+        } else if is_inner_join && can_evaluate_as_join_condition(&predicate)? {
+            // Convert to join condition - ExtractEquijoinPredicate will
+            // later extract equi-predicates for hash/merge join
+            join_conditions.push(predicate);
+        } else {
+            keep_predicates.push(predicate);
+        }
+    }
+
+    // Push inferred predicates (derived from join keys) to appropriate sides
+    for predicate in inferred_join_predicates {
+        if checker.is_left_only(&predicate) {
+            left_push.push(predicate);
+        } else if checker.is_right_only(&predicate) {
+            right_push.push(predicate);
+        }
+    }
+
+    // Extract pushable clauses from OR expressions
+    // Example: (a < 20 AND a = c) OR (b > 10 AND b = d)
+    // Can extract (a < 20) OR (b > 10) to push to left side
+    if left_preserved {
+        left_push.extend(extract_or_clauses_for_join(&keep_predicates, &left_schema_columns));
+    }
+    if right_preserved {
+        right_push.extend(extract_or_clauses_for_join(&keep_predicates, &right_schema_columns));
+    }
+
+    // Insert filters below join
+    if let Some(predicate) = conjunction(left_push) {
+        join.left = Arc::new(LogicalPlan::Filter(Filter::try_new(predicate, join.left)?));
+    }
+    if let Some(predicate) = conjunction(right_push) {
+        join.right = Arc::new(LogicalPlan::Filter(Filter::try_new(predicate, join.right)?));
+    }
+
+    // Remaining predicates become join filter or stay above
+    join.filter = conjunction(join_conditions);
+    let plan = LogicalPlan::Join(join);
+    let plan = if let Some(predicate) = conjunction(keep_predicates) {
+        LogicalPlan::Filter(Filter::try_new(predicate, Arc::new(plan))?)
+    } else {
+        plan
+    };
+    Ok(Transformed::yes(plan))
+}
+```
+
+This demonstrates join-aware filter pushdown: predicates are analyzed to
+determine which join side(s) they reference using `ColumnChecker`. The function
+respects join semantics (`left_preserved`/`right_preserved` depend on join type),
+converts eligible predicates to join conditions for inner joins, and extracts
+pushable clauses from complex OR expressions. Inferred predicates (derived from
+join key equalities) are also pushed down.
+
 The optimizer driver applies rules according to each rule's declared traversal
 order and repeats rule batches until a fixed point or configured pass limit is
 reached. Each rule returns whether it changed the plan, which lets the optimizer
@@ -457,6 +624,78 @@ pub trait ExecutionPlan: Any + Debug + DisplayAs + Send + Sync {
 | `datafusion/physical-plan/src/memory.rs` | Implements in-memory table execution. It is the physical operator used for registered memory batches and many tests. |
 | `datafusion/physical-plan/src/stream.rs` | Defines stream helpers and `RecordBatchStream` plumbing used by execution operators. |
 | `datafusion/physical-plan/src/metrics.rs` | Defines metric collection for physical execution. Operators use this to report elapsed time, output rows, memory, spills, and other runtime counters. |
+
+#### Implementation Example
+
+The `FilterExecStream::poll_next()` method in `datafusion/physical-plan/src/filter.rs`
+(lines 1012-1090) shows the actual filtering logic with predicate evaluation,
+batch coalescing, and early termination on limit:
+
+```rust
+impl Stream for FilterExecStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let elapsed_compute = self.metrics.baseline_metrics.elapsed_compute().clone();
+        loop {
+            // Return completed batch if ready
+            if let Some(batch) = self.batch_coalescer.next_completed_batch() {
+                self.metrics.selectivity.add_part(batch.num_rows());
+                return self.metrics.baseline_metrics.record_poll(Poll::Ready(Some(Ok(batch))));
+            }
+
+            if self.batch_coalescer.is_finished() {
+                return Poll::Ready(None);
+            }
+
+            // Pull next batch from input stream
+            match ready!(self.input.poll_next_unpin(cx)) {
+                None => {
+                    self.batch_coalescer.finish()?;
+                    // Release input pipeline resources early
+                    self.input = Box::pin(EmptyRecordBatchStream::new(self.input.schema()));
+                }
+                Some(Ok(batch)) => {
+                    let timer = elapsed_compute.timer();
+
+                    // Evaluate predicate, apply projection, filter rows
+                    let status = self.predicate.evaluate(&batch)
+                        .and_then(|v| v.into_array(batch.num_rows()))
+                        .and_then(|(array, batch)| {
+                            match as_boolean_array(&array) {
+                                Ok(filter_array) => {
+                                    self.metrics.selectivity.add_total(batch.num_rows());
+                                    let batch = filter_record_batch(&batch, filter_array)?;
+                                    self.batch_coalescer.push_batch(batch)
+                                }
+                                Err(_) => internal_err!("Non-boolean predicate")
+                            }
+                        })?;
+                    timer.done();
+
+                    match status {
+                        PushBatchStatus::Continue => { /* keep pulling */ }
+                        PushBatchStatus::LimitReached => {
+                            // Stop early when fetch limit reached
+                            self.batch_coalescer.finish()?;
+                            self.input = Box::pin(EmptyRecordBatchStream::new(self.input.schema()));
+                        }
+                    }
+                }
+                Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+            }
+        }
+    }
+}
+```
+
+This demonstrates the streaming execution model: `poll_next()` implements async
+stream polling using Rust's `Future`/`Poll` pattern. Key aspects include: (1)
+batch coalescing to combine small filtered batches into larger output batches,
+(2) predicate evaluation via `PhysicalExpr::evaluate()` returning a boolean
+array, (3) Arrow's `filter_record_batch()` kernel to select matching rows, (4)
+early termination when `LimitReached` by releasing the input stream, and (5)
+metrics tracking for selectivity and compute time.
 
 The central `ExecutionPlan` method is `execute(partition, context)`. The
 partition argument tells an operator which output partition to produce. Leaf
@@ -683,6 +922,70 @@ pub trait Accumulator: Send + Sync + Debug + std::any::Any {
 | `datafusion/functions-aggregate-common/src/aggregate.rs` | Provides shared aggregate helpers and traits used by aggregate implementations. It reduces duplication across built-in aggregate files. |
 | `datafusion/physical-expr/src/aggregate.rs` | Converts aggregate UDF calls into physical aggregate expressions that can create accumulators and expose state fields to physical aggregate execution. |
 | `datafusion/physical-plan/src/aggregates/mod.rs` | Coordinates physical aggregate execution across modes such as partial, final, and single-phase aggregation. |
+
+#### Implementation Example
+
+The `group_aggregate_batch()` method in `datafusion/physical-plan/src/aggregates/row_hash.rs`
+(lines 919-1015) shows the core grouped aggregation algorithm that maps input
+rows to groups and updates accumulators:
+
+```rust
+impl GroupedHashAggregateStream {
+    /// Perform group-by aggregation for the given [`RecordBatch`].
+    fn group_aggregate_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        // Evaluate the grouping expressions (e.g., columns in GROUP BY)
+        let group_by_values = evaluate_group_by(&self.group_by, batch)?;
+
+        // Evaluate the aggregation expressions (e.g., the column in SUM(col))
+        let input_values = evaluate_many(&self.aggregate_arguments, batch)?;
+
+        // Evaluate filter expressions for filtered aggregates like COUNT(*) FILTER (WHERE x > 0)
+        let filter_values = evaluate_optional(&self.filter_expressions, batch)?;
+
+        for group_values in &group_by_values {
+            // Intern group keys and get group indices for each row
+            // group_values is an array of group key values
+            // current_group_indices maps each row to its group index
+            let starting_num_groups = self.group_values.len();
+            self.group_values.intern(group_values, &mut self.current_group_indices)?;
+            let group_indices = &self.current_group_indices;
+
+            // Update ordering information for streaming emission of completed groups
+            let total_num_groups = self.group_values.len();
+            if total_num_groups > starting_num_groups {
+                self.group_ordering.new_groups(group_values, group_indices, total_num_groups)?;
+            }
+
+            // Update each accumulator with the batch data and group assignments
+            let t = self.accumulators.iter_mut()
+                .zip(input_values.iter())
+                .zip(filter_values.iter());
+
+            for ((acc, values), opt_filter) in t {
+                let opt_filter = opt_filter.as_ref().map(|filter| filter.as_boolean());
+
+                // Partial aggregation: update with raw input values
+                if self.mode.input_mode() == AggregateInputMode::Raw {
+                    acc.update_batch(values, group_indices, opt_filter, total_num_groups)?;
+                } else {
+                    // Final aggregation: merge partial states from other partitions
+                    acc.merge_batch(values, group_indices, None, total_num_groups)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+```
+
+This demonstrates the hash aggregation algorithm: (1) `group_values.intern()`
+maps group key arrays to integer group indices using an internal hash table,
+(2) `group_ordering` tracks which groups can be emitted early when input is
+sorted, (3) `GroupsAccumulator::update_batch()` updates accumulator state for
+all rows in a batch at once using vectorized operations with the group indices
+array, and (4) the mode determines whether to aggregate raw values (partial) or
+merge pre-aggregated states (final). This batched, vectorized approach is much
+faster than per-row accumulation.
 
 The main aggregate logic is state-based. Each aggregate implementation creates
 an `Accumulator` or grouped accumulator. `update_batch` consumes input arrays and
@@ -1007,6 +1310,74 @@ pub enum MemoryLimit {
 | `datafusion/execution/src/disk_manager.rs` | Manages temporary files used by spilling operators. It controls where spill files are created and cleaned up. |
 | `datafusion/execution/src/object_store.rs` | Registers and resolves object stores used by file scans. File data sources depend on this to read local files, cloud object stores, and other storage backends through one interface. |
 | `datafusion/execution/src/task.rs` | Defines task-level execution context used by physical operators. It carries session configuration, runtime resources, and function registries into `ExecutionPlan::execute`. |
+
+#### Implementation Example
+
+The `GroupedHashAggregateStream::spill()` method in
+`datafusion/physical-plan/src/aggregates/row_hash.rs` (lines 1237-1298) shows
+how operators interact with memory pools during spilling:
+
+```rust
+impl GroupedHashAggregateStream {
+    /// Emit all intermediate aggregation states, sort them, and store them on disk.
+    fn spill(&mut self) -> Result<()> {
+        // Emit intermediate state as a RecordBatch
+        let Some(emit) = self.emit(EmitTo::All, true)? else {
+            return Ok(());
+        };
+
+        // Free accumulated state BEFORE reserving sort memory
+        // This gives the pool room for the sort operation
+        self.clear_shrink(0);
+        self.update_memory_reservation()?;
+
+        // Calculate memory needed for sorting (worst case: 2X buffer size)
+        let batch_size_ratio = self.batch_size as f32 / emit.num_rows() as f32;
+        let batch_memory = get_record_batch_memory_size(&emit);
+        let sort_memory = (batch_memory
+            + (emit.get_sliced_size()? as f32 * batch_size_ratio) as usize)
+            .min(batch_memory * 2);
+
+        // Reserve memory for sort - if this fails, we cannot spill
+        self.reservation.try_grow(sort_memory).map_err(|err| {
+            resources_datafusion_err!(
+                "Failed to reserve memory for sort during spill: {err}"
+            )
+        })?;
+
+        // Sort and write to disk
+        let sorted_iter = IncrementalSortIterator::new(
+            emit,
+            self.spill_state.spill_expr.clone(),
+            self.batch_size,
+        );
+        let spillfile = self.spill_state.spill_manager
+            .spill_record_batch_iter_and_return_max_batch_memory(
+                sorted_iter,
+                "HashAggSpill",
+            )?;
+
+        // Release sort memory now that sorting is complete
+        self.reservation.shrink(sort_memory);
+
+        // Track spill file for later merge
+        if let Some((spillfile, max_batch_memory)) = spillfile {
+            self.spill_state.spills.push(SortedSpillFile {
+                file: spillfile,
+                max_record_batch_memory: max_batch_memory,
+            });
+        }
+        Ok(())
+    }
+}
+```
+
+This demonstrates the complete spill cycle: (1) emit in-memory state to a batch,
+(2) release hash table memory to make room for sorting, (3) reserve temporary
+memory for the sort operation via `try_grow()`, (4) sort data by group keys and
+write to disk through `SpillManager`, (5) release sort memory via `shrink()`,
+and (6) track the spill file for later streaming merge. The careful memory
+accounting ensures the pool stays within limits while still completing the spill.
 
 Operators request memory through `MemoryConsumer` reservations. A sort or hash
 aggregate can grow its reservation while building in-memory state. If the memory
