@@ -100,19 +100,63 @@ SELECT last_day(null::DATE);
 NULL
 
 
-statement error Failed to coerce arguments to satisfy a call to 'last_day' function
+# Spark casts STRING and TIMESTAMP arguments to DATE
+query D
+SELECT last_day('2016-02-07');
+----
+2016-02-29
+
+query D
+SELECT last_day('2016-02-07'::string);
+----
+2016-02-29
+
+query D
+SELECT last_day(arrow_cast('2016-02-07', 'LargeUtf8'));
+----
+2016-02-29
+
+query D
+SELECT last_day(arrow_cast('2016-02-07', 'Utf8View'));
+----
+2016-02-29
+
+query D
+SELECT last_day(TIMESTAMP '2016-02-07 01:02:03');
+----
+2016-02-29
+
+query D
+SELECT last_day(arrow_cast('2024-12-31 23:59:59', 'Timestamp(Microsecond, None)'));
+----
+2024-12-31
+
+query D
+SELECT last_day(null::string);
+----
+NULL
+
+query D
+SELECT last_day(a) FROM (VALUES ('2016-02-07'), ('2023-04-15'), (NULL)) AS t(a);
+----
+2016-02-29
+2023-04-30
+NULL
+
+# Spark returns NULL here with ANSI off; DataFusion's cast errors
+statement error Cannot cast string 'foo' to value of Date32 type
 select last_day('foo');
 
 
-statement error Failed to coerce arguments to satisfy a call to 'last_day' function
+statement error Function 'last_day' requires Date, but received Int64
 select last_day(123);
 
 
 statement error 'last_day' does not support zero arguments
 select last_day();
 
-statement error Failed to coerce arguments to satisfy a call to 'last_day' function
+statement error Function 'last_day' expects 1 arguments but received 2
 select last_day(last_day('2016-02-07'::string, 'foo'));
 
-statement error Failed to coerce arguments to satisfy a call to 'last_day' function
+statement error Cannot cast string '2016-02-31' to value of Date32 type
 select last_day(last_day('2016-02-31'::string));

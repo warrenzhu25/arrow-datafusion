@@ -24,7 +24,7 @@ use arrow::datatypes::{
     Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 use datafusion_common::types::{
-    NativeType, logical_float32, logical_float64, logical_int32,
+    NativeType, logical_float32, logical_float64, logical_int32, logical_string,
 };
 use datafusion_common::{Result, ScalarValue, exec_err, not_impl_err};
 use datafusion_expr::{
@@ -66,9 +66,13 @@ impl SparkRound {
             NativeType::Int32,
         );
         let float32 = Coercion::new_exact(TypeSignatureClass::Native(logical_float32()));
+        // Spark implicitly casts STRING to DOUBLE for `round`
         let float64 = Coercion::new_implicit(
             TypeSignatureClass::Native(logical_float64()),
-            vec![TypeSignatureClass::Numeric],
+            vec![
+                TypeSignatureClass::Numeric,
+                TypeSignatureClass::Native(logical_string()),
+            ],
             NativeType::Float64,
         );
         Self {

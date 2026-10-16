@@ -20,11 +20,12 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, AsArray, Date32Array};
 use arrow::datatypes::{DataType, Date32Type, Field, FieldRef};
 use chrono::{Datelike, Duration, NaiveDate};
+use datafusion_common::types::{NativeType, logical_date, logical_string};
 use datafusion_common::utils::take_function_args;
 use datafusion_common::{Result, ScalarValue, exec_datafusion_err, internal_err};
 use datafusion_expr::{
-    ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature,
-    Volatility,
+    Coercion, ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl,
+    Signature, TypeSignatureClass, Volatility,
 };
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -41,7 +42,18 @@ impl Default for SparkLastDay {
 impl SparkLastDay {
     pub fn new() -> Self {
         Self {
-            signature: Signature::exact(vec![DataType::Date32], Volatility::Immutable),
+            // Spark casts the argument to DATE, so STRING and TIMESTAMP are accepted
+            signature: Signature::coercible(
+                vec![Coercion::new_implicit(
+                    TypeSignatureClass::Native(logical_date()),
+                    vec![
+                        TypeSignatureClass::Native(logical_string()),
+                        TypeSignatureClass::Timestamp,
+                    ],
+                    NativeType::Date,
+                )],
+                Volatility::Immutable,
+            ),
         }
     }
 }

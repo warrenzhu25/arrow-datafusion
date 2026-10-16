@@ -118,8 +118,36 @@ SELECT weekday(arrow_cast('2024-01-07 03:00:00', 'Timestamp(Nanosecond, Some("UT
 ----
 6
 
-# Error: wrong argument type (string without cast)
-statement error Function 'weekday' requires Date, but received String
+# Spark casts STRING arguments to DATE
+query I
+SELECT weekday('2016-02-07');
+----
+6
+
+query I
+SELECT weekday(arrow_cast('2024-12-31', 'LargeUtf8'));
+----
+1
+
+query I
+SELECT weekday(arrow_cast('2024-12-31', 'Utf8View'));
+----
+1
+
+query I
+SELECT weekday(null::string);
+----
+NULL
+
+query I
+SELECT weekday(a) FROM (VALUES ('2016-02-07'), ('2024-12-31'), (NULL)) AS t(a);
+----
+6
+1
+NULL
+
+# Spark returns NULL here with ANSI off; DataFusion's cast errors
+statement error Cannot cast string 'not-a-date' to value of Date32 type
 SELECT weekday('not-a-date');
 
 # Error: wrong argument type (integer)

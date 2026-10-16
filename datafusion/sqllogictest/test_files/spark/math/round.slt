@@ -592,8 +592,44 @@ set datafusion.execution.enable_ansi_mode = false;
 # Negative tests: unsupported data types
 # -------------------------------------------------------------------
 
-# round(string) should fail
-query error Error during planning: Function 'round' failed to match any signature
+# Spark implicitly casts STRING to DOUBLE
+query R
+SELECT round('1.5');
+----
+2
+
+query R
+SELECT round('-2.5'::varchar);
+----
+-3
+
+query R
+SELECT round('3.14159', 2);
+----
+3.14
+
+query R
+SELECT round(arrow_cast('125', 'LargeUtf8'), -1);
+----
+130
+
+query R
+SELECT round(arrow_cast('2.345', 'Utf8View'), 2);
+----
+2.35
+
+query R
+SELECT round(null::varchar);
+----
+NULL
+
+query T
+SELECT arrow_typeof(round('1.5'));
+----
+Float64
+
+# Spark returns NULL here with ANSI off; DataFusion's cast errors
+query error Cannot cast string 'hello' to value of Float64 type
 SELECT round('hello'::varchar);
 
 # round(boolean) should fail

@@ -111,5 +111,22 @@ SELECT unbase64('123'::string);
 query error Failed to decode value using base64
 SELECT unbase64('123'::bytea);
 
-query error Error during planning: Function 'unbase64' requires Binary, but received Int32 \(DataType: Int32\)
+# Spark casts numeric inputs to STRING first, so 1234 decodes '1234'
+query ?
+SELECT unbase64(1234::integer);
+----
+d76df8
+
+query ?
+SELECT unbase64(12345678::bigint);
+----
+d76df8e7aefc
+
+query ?
+SELECT unbase64(null::integer);
+----
+NULL
+
+# Spark returns d7 here; DataFusion's base64pad decoder rejects unpadded input
+query error Failed to decode value using base64pad
 SELECT unbase64(12::integer);

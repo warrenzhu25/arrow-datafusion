@@ -23,9 +23,10 @@ use datafusion_common::types::{NativeType, logical_string};
 use datafusion_common::utils::take_function_args;
 use datafusion_common::{Result, exec_err, internal_err};
 use datafusion_expr::simplify::{ExprSimplifyResult, SimplifyContext};
-use datafusion_expr::{Coercion, Expr, ReturnFieldArgs, TypeSignatureClass, lit};
+use datafusion_expr::{Coercion, Expr, ReturnFieldArgs, TypeSignatureClass, cast, lit};
 use datafusion_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature,
+    Volatility,
 };
 use datafusion_functions::expr_fn::{decode, encode};
 
@@ -118,12 +119,20 @@ impl Default for SparkUnBase64 {
 impl SparkUnBase64 {
     pub fn new() -> Self {
         Self {
-            signature: Signature::coercible(
-                vec![Coercion::new_implicit(
-                    TypeSignatureClass::Binary,
-                    vec![TypeSignatureClass::Native(logical_string())],
-                    NativeType::Binary,
-                )],
+            signature: Signature::one_of(
+                vec![
+                    TypeSignature::Coercible(vec![Coercion::new_implicit(
+                        TypeSignatureClass::Binary,
+                        vec![TypeSignatureClass::Native(logical_string())],
+                        NativeType::Binary,
+                    )]),
+                    // Spark casts other inputs (e.g. numbers) to STRING first
+                    TypeSignature::Coercible(vec![Coercion::new_implicit(
+                        TypeSignatureClass::Native(logical_string()),
+                        vec![TypeSignatureClass::Numeric],
+                        NativeType::String,
+                    )]),
+                ],
                 Volatility::Immutable,
             ),
         }
@@ -163,9 +172,16 @@ impl ScalarUDFImpl for SparkUnBase64 {
     fn simplify(
         &self,
         args: Vec<Expr>,
-        _info: &SimplifyContext,
+        info: &SimplifyContext,
     ) -> Result<ExprSimplifyResult> {
         let [bin] = take_function_args(self.name(), args)?;
+        // Numeric inputs are coerced to STRING by the signature. The simplified
+        // `decode` call is not type-coerced again, so cast strings to binary here.
+        let bin = if info.get_data_type(&bin)?.is_string() {
+            cast(bin, DataType::Binary)
+        } else {
+            bin
+        };
         Ok(ExprSimplifyResult::Simplified(decode(
             bin,
             lit("base64pad"),

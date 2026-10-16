@@ -20,7 +20,7 @@ use std::sync::Arc;
 use arrow::array::{AsArray, StringArray};
 use arrow::compute::{DatePart, date_part};
 use arrow::datatypes::{DataType, Field, FieldRef};
-use datafusion_common::types::{NativeType, logical_date};
+use datafusion_common::types::{NativeType, logical_date, logical_string};
 use datafusion_common::utils::take_function_args;
 use datafusion_common::{Result, ScalarValue, internal_err};
 use datafusion_expr::{
@@ -54,10 +54,14 @@ impl Default for SparkMonthName {
 impl SparkMonthName {
     pub fn new() -> Self {
         Self {
+            // Spark casts the argument to DATE, so STRING and TIMESTAMP are accepted
             signature: Signature::coercible(
                 vec![Coercion::new_implicit(
                     TypeSignatureClass::Native(logical_date()),
-                    vec![TypeSignatureClass::Timestamp],
+                    vec![
+                        TypeSignatureClass::Native(logical_string()),
+                        TypeSignatureClass::Timestamp,
+                    ],
                     NativeType::Date,
                 )],
                 Volatility::Immutable,

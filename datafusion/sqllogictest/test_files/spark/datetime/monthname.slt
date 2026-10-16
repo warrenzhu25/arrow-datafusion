@@ -162,8 +162,36 @@ SELECT monthname(arrow_cast('2024-10-31 23:59:59', 'Timestamp(Microsecond, Some(
 ----
 Oct
 
-# Error: wrong argument type (string without cast)
-statement error Function 'monthname' requires Date, but received String
+# Spark casts STRING arguments to DATE
+query T
+SELECT monthname('2016-02-07');
+----
+Feb
+
+query T
+SELECT monthname(arrow_cast('2024-12-31', 'LargeUtf8'));
+----
+Dec
+
+query T
+SELECT monthname(arrow_cast('2024-12-31', 'Utf8View'));
+----
+Dec
+
+query T
+SELECT monthname(null::string);
+----
+NULL
+
+query T
+SELECT monthname(a) FROM (VALUES ('2016-02-07'), ('2024-12-31'), (NULL)) AS t(a);
+----
+Feb
+Dec
+NULL
+
+# Spark returns NULL here with ANSI off; DataFusion's cast errors
+statement error Cannot cast string 'not-a-date' to value of Date32 type
 SELECT monthname('not-a-date');
 
 # Error: wrong argument type (integer)
