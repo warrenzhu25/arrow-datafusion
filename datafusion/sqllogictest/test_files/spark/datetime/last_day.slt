@@ -146,6 +146,13 @@ SELECT last_day(arrow_cast('2024-12-31 23:59:59', 'Timestamp(Microsecond, None)'
 ----
 2024-12-31
 
+# Spark converts the instant to a date in the session time zone (UTC here) and
+# returns 2024-02-29. DataFusion uses the timestamp's own time zone.
+query D
+SELECT last_day(arrow_cast('2024-01-31 23:00:00', 'Timestamp(Second, Some("America/New_York"))'));
+----
+2024-01-31
+
 query D
 SELECT last_day(null::string);
 ----
