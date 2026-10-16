@@ -111,6 +111,26 @@ SELECT unbase64('123'::string);
 query error Failed to decode value using base64
 SELECT unbase64('123'::bytea);
 
+query ?
+SELECT unbase64(arrow_cast('U3BhcmsgU1FM', 'LargeUtf8'));
+----
+537061726b2053514c
+
+query T
+SELECT arrow_typeof(unbase64(arrow_cast('U3BhcmsgU1FM', 'LargeUtf8')));
+----
+LargeBinary
+
+query ?
+SELECT unbase64(arrow_cast('U3BhcmsgU1FM', 'Utf8View'));
+----
+537061726b2053514c
+
+query T
+SELECT arrow_typeof(unbase64(arrow_cast('U3BhcmsgU1FM', 'Utf8View')));
+----
+Binary
+
 # Spark casts numeric inputs to STRING first, so 1234 decodes '1234'
 query ?
 SELECT unbase64(1234::integer);

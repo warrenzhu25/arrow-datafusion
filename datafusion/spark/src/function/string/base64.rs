@@ -121,12 +121,11 @@ impl SparkUnBase64 {
         Self {
             signature: Signature::one_of(
                 vec![
-                    TypeSignature::Coercible(vec![Coercion::new_implicit(
+                    TypeSignature::Coercible(vec![Coercion::new_exact(
                         TypeSignatureClass::Binary,
-                        vec![TypeSignatureClass::Native(logical_string())],
-                        NativeType::Binary,
                     )]),
-                    // Spark casts other inputs (e.g. numbers) to STRING first
+                    // Spark casts the input to STRING, so numbers are accepted too.
+                    // Strings are converted to binary in `simplify`.
                     TypeSignature::Coercible(vec![Coercion::new_implicit(
                         TypeSignatureClass::Native(logical_string()),
                         vec![TypeSignatureClass::Numeric],
@@ -155,7 +154,7 @@ impl ScalarUDFImpl for SparkUnBase64 {
     fn return_field_from_args(&self, args: ReturnFieldArgs<'_>) -> Result<FieldRef> {
         let [str] = take_function_args(self.name(), args.arg_fields)?;
         let return_type = match str.data_type() {
-            DataType::LargeBinary => DataType::LargeBinary,
+            DataType::LargeBinary | DataType::LargeUtf8 => DataType::LargeBinary,
             _ => DataType::Binary,
         };
         Ok(Arc::new(Field::new(
@@ -175,12 +174,13 @@ impl ScalarUDFImpl for SparkUnBase64 {
         info: &SimplifyContext,
     ) -> Result<ExprSimplifyResult> {
         let [bin] = take_function_args(self.name(), args)?;
-        // Numeric inputs are coerced to STRING by the signature. The simplified
-        // `decode` call is not type-coerced again, so cast strings to binary here.
-        let bin = if info.get_data_type(&bin)?.is_string() {
-            cast(bin, DataType::Binary)
-        } else {
-            bin
+        // The simplified `decode` call is not type-coerced again, so convert
+        // strings to the matching binary type here.
+        let bin = match info.get_data_type(&bin)? {
+            DataType::Utf8 => cast(bin, DataType::Binary),
+            DataType::LargeUtf8 => cast(bin, DataType::LargeBinary),
+            DataType::Utf8View => cast(bin, DataType::BinaryView),
+            _ => bin,
         };
         Ok(ExprSimplifyResult::Simplified(decode(
             bin,

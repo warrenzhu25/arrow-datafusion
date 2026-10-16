@@ -619,6 +619,17 @@ SELECT round(arrow_cast('2.345', 'Utf8View'), 2);
 2.35
 
 query R
+SELECT round(a, 1) FROM (VALUES ('2.25'), (NULL)) AS t(a);
+----
+2.3
+NULL
+
+query R
+SELECT round('1e3');
+----
+1000
+
+query R
 SELECT round(null::varchar);
 ----
 NULL

@@ -122,6 +122,21 @@ SELECT last_day(arrow_cast('2016-02-07', 'Utf8View'));
 2016-02-29
 
 query D
+SELECT last_day('2016-02-07 01:02:03');
+----
+2016-02-29
+
+query D
+SELECT last_day('2016-02-07T01:02:03');
+----
+2016-02-29
+
+query D
+SELECT last_day('2016-2-7');
+----
+2016-02-29
+
+query D
 SELECT last_day(TIMESTAMP '2016-02-07 01:02:03');
 ----
 2016-02-29
@@ -146,6 +161,13 @@ NULL
 # Spark returns NULL here with ANSI off; DataFusion's cast errors
 statement error Cannot cast string 'foo' to value of Date32 type
 select last_day('foo');
+
+# Spark accepts these (returns 2016-02-29); DataFusion's string to date cast is stricter
+statement error Cannot cast string '2016-02' to value of Date32 type
+select last_day('2016-02');
+
+statement error Cannot cast string ' 2016-02-07 ' to value of Date32 type
+select last_day(' 2016-02-07 ');
 
 
 statement error Function 'last_day' requires Date, but received Int64
