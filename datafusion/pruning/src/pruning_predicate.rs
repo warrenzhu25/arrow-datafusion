@@ -1107,6 +1107,9 @@ fn build_statistics_record_batch<S: PruningStatistics + ?Sized>(
 struct PruningExpressionBuilder<'a> {
     column: phys_expr::Column,
     column_expr: Arc<dyn PhysicalExpr>,
+    /// The type of `column_expr`, which differs from `field` when the column
+    /// is wrapped in a cast
+    column_expr_type: DataType,
     op: Operator,
     scalar_expr: Arc<dyn PhysicalExpr>,
     field: &'a Field,
@@ -1158,10 +1161,12 @@ impl<'a> PruningExpressionBuilder<'a> {
         let Some((_, field)) = schema.column_with_name(column.name()) else {
             return plan_err!("Field not found in schema");
         };
+        let column_expr_type = column_expr.data_type(schema)?;
 
         Ok(Self {
             column,
             column_expr,
+            column_expr_type,
             op: correct_operator,
             scalar_expr,
             field,
@@ -1262,11 +1267,22 @@ fn rewrite_expr_to_prunable(
             scalar_expr,
             schema,
         )?;
-        let left = Arc::new(phys_expr::CastExpr::new_with_target_field(
-            left,
-            Arc::clone(cast.target_field()),
-            None,
-        ));
+        let from_type = left.data_type(schema)?;
+        let left: PhysicalExprRef = if !from_type.is_string()
+            && is_binary_or_string(&from_type)
+            && cast.cast_type().is_string()
+        {
+            // Binary min/max statistics need not be valid UTF-8 (for example
+            // when truncated), so cast them without failing: an invalid bound
+            // becomes NULL, which keeps the container.
+            Arc::new(phys_expr::TryCastExpr::new(left, cast.cast_type().clone()))
+        } else {
+            Arc::new(phys_expr::CastExpr::new_with_target_field(
+                left,
+                Arc::clone(cast.target_field()),
+                None,
+            ))
+        };
         // PruningPredicate does not support pruning on nested fields yet.
         // End-to-end nested-field pruning also requires Parquet statistics
         // extraction to agree with PruningPredicate on a stats representation
@@ -1365,13 +1381,26 @@ fn verify_support_type_for_prune(from_type: &DataType, to_type: &DataType) -> Re
     // If both types are strings or both are not strings (number, timestamp, etc)
     // then we can compare them.
     // PruningPredicate does not support casting of strings to numbers and such.
-    if from_type.is_string() == to_type.is_string() {
+    //
+    // Binary and string types both order values byte-wise, so a cast between
+    // them preserves the order too.
+    if from_type.is_string() == to_type.is_string()
+        || (is_binary_or_string(from_type) && is_binary_or_string(to_type))
+    {
         Ok(())
     } else {
         plan_err!(
             "Try Cast/Cast with from type {from_type} to type {to_type} is not supported"
         )
     }
+}
+
+fn is_binary_or_string(data_type: &DataType) -> bool {
+    data_type.is_string()
+        || matches!(
+            data_type,
+            DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+        )
 }
 
 /// replaces a column with an old name with a new name in an expression
@@ -2268,8 +2297,9 @@ fn build_like_match(
     let min_column_expr = expr_builder.min_column_expr().ok()?;
     let max_column_expr = expr_builder.max_column_expr().ok()?;
     let scalar_expr = expr_builder.scalar_expr();
-    // Synthesized bounds must match the column type (e.g. `Utf8View`).
-    let target_type = expr_builder.field.data_type();
+    // Synthesized bounds must match the type the bounds are compared with
+    // (e.g. `Utf8View`), which is the cast type when the column is cast.
+    let target_type = &expr_builder.column_expr_type.clone();
     // check that the scalar is a string literal
     let s = extract_string_literal(scalar_expr)?;
     // ANSI SQL specifies two wildcards: % and _. % matches zero or more characters, _ matches exactly one character.
@@ -7313,6 +7343,109 @@ mod tests {
     /// `expected` is a vector of bools, where true means the row group should
     /// be kept, and false means it should be pruned.
     // TODO refactor other tests to use this to reduce boiler plate
+    /// Statistics of a binary column, for predicates that cast it to a string
+    /// (e.g. `binary_col LIKE 'a%'` with default options)
+    fn binary_setup(data_type: &DataType) -> (SchemaRef, TestStatistics) {
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("b1", data_type.clone(), true)]));
+        let min: BinaryArray = vec![
+            Some(b"A".as_slice()),
+            Some(b"N".as_slice()),
+            None,
+            // not valid UTF-8, e.g. a truncated statistic
+            Some(b"A\xff".as_slice()),
+        ]
+        .into_iter()
+        .collect();
+        let max: BinaryArray = vec![
+            Some(b"L".as_slice()),
+            Some(b"Z".as_slice()),
+            None,
+            Some(b"B\xff".as_slice()),
+        ]
+        .into_iter()
+        .collect();
+        let statistics = TestStatistics::new().with(
+            "b1",
+            ContainerStats::new()
+                .with_min(arrow::compute::cast(&min, data_type).unwrap())
+                .with_max(arrow::compute::cast(&max, data_type).unwrap()),
+        );
+        (schema, statistics)
+    }
+
+    #[test]
+    fn prune_binary_cast_to_string() {
+        for data_type in [
+            DataType::Binary,
+            DataType::LargeBinary,
+            DataType::BinaryView,
+        ] {
+            let (schema, statistics) = binary_setup(&data_type);
+            let m = || lit(ScalarValue::Utf8View(Some("M".to_string())));
+
+            let expr = cast(col("b1"), DataType::Utf8View).eq(m());
+            #[rustfmt::skip]
+            let expected_ret = &[
+                // b1 ["A", "L"] ==> no rows can pass (not keep)
+                false,
+                // b1 ["N", "Z"] ==> no rows can pass (not keep)
+                false,
+                // b1 [NULL, NULL] ==> unknown (must keep)
+                true,
+                // b1 invalid UTF-8 bounds ==> unknown (must keep)
+                true,
+            ];
+            prune_with_expr(expr, &schema, &statistics, expected_ret);
+
+            let expr = cast(col("b1"), DataType::Utf8View).gt(m());
+            #[rustfmt::skip]
+            let expected_ret = &[
+                // b1 ["A", "L"] ==> no rows can pass (not keep)
+                false,
+                // b1 ["N", "Z"] ==> some rows could pass (must keep)
+                true,
+                // b1 [NULL, NULL] ==> unknown (must keep)
+                true,
+                // b1 invalid UTF-8 bounds ==> unknown (must keep)
+                true,
+            ];
+            prune_with_expr(expr, &schema, &statistics, expected_ret);
+
+            let expr = cast(col("b1"), DataType::Utf8View)
+                .like(lit(ScalarValue::Utf8View(Some("P%".to_string()))));
+            #[rustfmt::skip]
+            let expected_ret = &[
+                // b1 ["A", "L"] ==> no rows can pass (not keep)
+                false,
+                // b1 ["N", "Z"] ==> some rows could pass (must keep)
+                true,
+                // b1 [NULL, NULL] ==> unknown (must keep)
+                true,
+                // b1 invalid UTF-8 bounds ==> unknown (must keep)
+                true,
+            ];
+            prune_with_expr(expr, &schema, &statistics, expected_ret);
+
+            let expr = cast(col("b1"), DataType::Utf8)
+                .eq(lit(ScalarValue::Utf8(Some("M".to_string()))));
+            prune_with_expr(expr, &schema, &statistics, &[false, false, true, true]);
+        }
+    }
+
+    #[test]
+    fn row_group_predicate_cast_binary_string() {
+        let schema = Schema::new(vec![Field::new("c1", DataType::Binary, false)]);
+        // The statistics are cast with TRY_CAST so invalid UTF-8 becomes NULL
+        let expected_expr = "c1_null_count@2 != row_count@3 AND TRY_CAST(c1_min@0 AS Utf8View) <= 1 AND 1 <= TRY_CAST(c1_max@1 AS Utf8View)";
+
+        let expr = cast(col("c1"), DataType::Utf8View)
+            .eq(lit(ScalarValue::Utf8View(Some("1".to_string()))));
+        let predicate_expr =
+            test_build_predicate_expression(&expr, &schema, &mut RequiredColumns::new());
+        assert_eq!(predicate_expr.to_string(), expected_expr);
+    }
+
     fn prune_with_expr(
         expr: Expr,
         schema: &SchemaRef,

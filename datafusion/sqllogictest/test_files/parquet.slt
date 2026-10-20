@@ -463,6 +463,27 @@ physical_plan
 03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet/binary_as_string.parquet]]}, projection=[binary_col, largebinary_col, binaryview_col], file_type=parquet, predicate=CAST(binary_col@0 AS Utf8View) LIKE %a% AND CAST(largebinary_col@1 AS Utf8View) LIKE %a% AND CAST(binaryview_col@2 AS Utf8View) LIKE %a%
 
 
+# The cast from binary to string keeps the byte order, so the statistics can
+# still prune row groups (note the pruning_predicate)
+query TT
+EXPLAIN
+  SELECT binary_col
+  FROM binary_as_string_default
+ WHERE binary_col LIKE 'b%';
+----
+logical_plan
+01)Filter: CAST(binary_as_string_default.binary_col AS Utf8View) LIKE Utf8View("b%")
+02)--TableScan: binary_as_string_default projection=[binary_col], partial_filters=[CAST(binary_as_string_default.binary_col AS Utf8View) LIKE Utf8View("b%")]
+physical_plan
+01)FilterExec: CAST(binary_col@0 AS Utf8View) LIKE b%
+02)--RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet/binary_as_string.parquet]]}, projection=[binary_col], file_type=parquet, predicate=CAST(binary_col@0 AS Utf8View) LIKE b%, pruning_predicate=binary_col_null_count@2 != row_count@3 AND TRY_CAST(binary_col_min@0 AS Utf8View) <= c AND b <= TRY_CAST(binary_col_max@1 AS Utf8View), required_guarantees=[]
+
+query ?
+SELECT binary_col FROM binary_as_string_default WHERE binary_col LIKE 'b%';
+----
+626262
+
 statement ok
 DROP TABLE binary_as_string_default;
 
