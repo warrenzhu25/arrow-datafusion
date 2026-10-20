@@ -597,6 +597,76 @@ FixedSizeBinary(16) 0166ce1d46129ad104fa4990c6057c91
 statement ok
 DROP TABLE test_non_utf8_binary;
 
+## Invalid UTF-8 in a binary column read with binary_as_string
+## must error instead of crashing
+## https://github.com/apache/datafusion/issues/25509
+
+query I
+COPY (
+  SELECT
+    decode('ff', 'hex')                               AS binary_col,
+    arrow_cast(decode('ff', 'hex'), 'LargeBinary')    AS largebinary_col,
+    arrow_cast(decode('ff', 'hex'), 'BinaryView')     AS binaryview_col,
+    arrow_cast('héllo', 'Binary')                     AS valid_col
+)
+TO 'test_files/scratch/parquet/invalid_utf8_binary.parquet'
+STORED AS PARQUET;
+----
+1
+
+statement ok
+CREATE EXTERNAL TABLE invalid_utf8_view
+STORED AS PARQUET LOCATION 'test_files/scratch/parquet/invalid_utf8_binary.parquet'
+OPTIONS ('binary_as_string' 'true');
+
+query error Encountered non.UTF-8 data
+SELECT binary_col FROM invalid_utf8_view;
+
+query error Encountered non.UTF-8 data
+SELECT largebinary_col FROM invalid_utf8_view;
+
+query error Encountered non.UTF-8 data
+SELECT binaryview_col FROM invalid_utf8_view;
+
+query error Encountered non.UTF-8 data
+SELECT upper(binary_col) FROM invalid_utf8_view;
+
+query error Encountered non.UTF-8 data
+SELECT count(*) FROM invalid_utf8_view WHERE binary_col = 'ok';
+
+# Valid UTF-8, including multibyte characters, still reads as a string
+query TT
+SELECT arrow_typeof(valid_col), valid_col FROM invalid_utf8_view;
+----
+Utf8View héllo
+
+query I
+SELECT count(*) FROM invalid_utf8_view;
+----
+1
+
+statement ok
+DROP TABLE invalid_utf8_view;
+
+statement ok
+CREATE EXTERNAL TABLE invalid_utf8_no_view
+STORED AS PARQUET LOCATION 'test_files/scratch/parquet/invalid_utf8_binary.parquet'
+OPTIONS ('binary_as_string' 'true', 'schema_force_view_types' 'false');
+
+query error Encountered non.UTF-8 data
+SELECT binary_col FROM invalid_utf8_no_view;
+
+query error Encountered non.UTF-8 data
+SELECT largebinary_col FROM invalid_utf8_no_view;
+
+query TT
+SELECT arrow_typeof(valid_col), valid_col FROM invalid_utf8_no_view;
+----
+Utf8 héllo
+
+statement ok
+DROP TABLE invalid_utf8_no_view;
+
 
 ## Tests for https://github.com/apache/datafusion/issues/13186
 statement ok

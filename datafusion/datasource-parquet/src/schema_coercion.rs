@@ -28,10 +28,13 @@
 //! Coercing a binary file column to a string type makes the Parquet reader
 //! build the string array itself. It only validates UTF-8 for columns carrying
 //! the `UTF8` logical annotation, which such a column by definition does not,
-//! so invalid bytes surface as an invalid string array rather than an error.
-//! That is long-standing behaviour for top-level and struct fields; it is not
-//! extended to map children, whose positional matching is newer, so binary map
-//! values keep going through the validating cast instead.
+//! so invalid bytes would surface as an invalid string array rather than an
+//! error (<https://github.com/apache/arrow-rs/issues/11140>), and later
+//! crash the process (<https://github.com/apache/datafusion/issues/25509>).
+//!
+//! The schema handed to the Parquet reader therefore never turns binary
+//! columns into strings: they are read as binary and cast to the table's
+//! string type afterwards, and that cast validates UTF-8.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -87,6 +90,10 @@ pub fn apply_file_schema_type_coercions(
 /// Like [`apply_file_schema_type_coercions`], but also coerces compatible
 /// string/binary file fields to dictionary types already present in the table
 /// schema.
+///
+/// This is the schema handed to the Parquet reader, so binary file fields are
+/// never read as strings here: they are read as binary and cast to the table's
+/// string type afterwards, which validates UTF-8. See the module docs.
 pub(crate) fn apply_file_schema_type_coercions_with_rle(
     table_schema: &Schema,
     file_schema: &Schema,
@@ -95,7 +102,7 @@ pub(crate) fn apply_file_schema_type_coercions_with_rle(
     let fields = coerce_fields_by_name(
         table_schema.fields(),
         file_schema.fields(),
-        true,
+        false,
         enable_rle_to_dictionary,
     )?;
     Some(Schema::new_with_metadata(
@@ -2006,12 +2013,10 @@ mod tests {
             Field::new("dict_col", DataType::Utf8, true),
             Field::new("string_col", DataType::Binary, true),
         ]);
+        // Without RLE nothing changes: binary is never read as a string
         let result =
-            apply_file_schema_type_coercions_with_rle(&table_schema, &file_schema, false)
-                .unwrap();
-
-        assert_eq!(result.field(0).data_type(), &DataType::Utf8);
-        assert_eq!(result.field(1).data_type(), &DataType::Utf8);
+            apply_file_schema_type_coercions_with_rle(&table_schema, &file_schema, false);
+        assert!(result.is_none());
     }
 
     fn dk(key: DataType) -> DataType {
